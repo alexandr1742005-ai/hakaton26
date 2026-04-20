@@ -35,15 +35,12 @@ REQUIRED_ENV_VARS = ["EMBEDDINGS_DENSE_URL", "RERANKER_URL", "QDRANT_URL"]
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
 
-# --- Параметры поиска ---
-# ОДИН запрос в Qdrant — усредняем векторы всех query-вариантов
 DENSE_PREFETCH_K = 50
 SPARSE_PREFETCH_K = 80
-RETRIEVE_K = 100         # берём топ-100 после RRF
-RERANK_TOP = 30          # rerank топ-30 (баланс качество/rate-limit)
-MAX_QUERY_VARIANTS = 3   # сколько текстов эмбеддим для усреднения
+RETRIEVE_K = 100
+RERANK_TOP = 30
+MAX_QUERY_VARIANTS = 3
 
-# Qwen3-Embedding поддерживает 8192 токенов — не обрезаем агрессивно
 DENSE_QUERY_MAX_CHARS = 2000
 RERANK_TEXT_MAX_CHARS = 3000
 
@@ -71,8 +68,6 @@ def get_upstream_kwargs() -> dict[str, Any]:
         headers["Authorization"] = f"Bearer {API_KEY}"
     return kwargs
 
-
-# ---------- Модели данных ----------
 
 class DateRange(BaseModel):
     from_: str = Field(alias="from")
@@ -126,8 +121,6 @@ class SparseVector(BaseModel):
     values: list[float] = Field(default_factory=list)
 
 
-# ---------- Lifespan ----------
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient(timeout=45.0)
@@ -142,10 +135,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Search Service", version="3.0.0", lifespan=lifespan)
 
 
-# ---------- Embeddings ----------
-
 async def embed_dense_batch(client: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
-    """Батч dense-эмбеддингов за ОДИН HTTP запрос."""
     response = await client.post(
         EMBEDDINGS_DENSE_URL,
         **get_upstream_kwargs(),
@@ -162,7 +152,6 @@ async def embed_dense_batch(client: httpx.AsyncClient, texts: list[str]) -> list
 
 @lru_cache(maxsize=1)
 def get_sparse_model() -> SparseTextEmbedding:
-    logger.info("Loading sparse model %s", SPARSE_MODEL_NAME)
     return SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
 
 
@@ -181,13 +170,7 @@ async def embed_sparse(text: str) -> SparseVector:
     return await asyncio.to_thread(embed_sparse_sync, text)
 
 
-# ---------- Vector averaging ----------
-
 def average_dense_vectors(vectors: list[list[float]]) -> list[float]:
-    """
-    Усредняем N dense векторов в один нормализованный.
-    Позволяет охватить несколько формулировок запроса за 1 Qdrant-запрос.
-    """
     if len(vectors) == 1:
         return vectors[0]
     dim = len(vectors[0])
@@ -195,27 +178,17 @@ def average_dense_vectors(vectors: list[list[float]]) -> list[float]:
     for vec in vectors:
         for i, v in enumerate(vec):
             result[i] += v
-    # L2 нормализация
     norm = sum(x * x for x in result) ** 0.5
     if norm > 0:
         result = [x / norm for x in result]
     return result
 
 
-# ---------- Query building ----------
-
 def build_query_texts(question: Question) -> list[str]:
-    """
-    Строим тексты для dense эмбеддинга.
-    Приоритет: search_text > text > hyde > variants
-    """
     queries: list[str] = []
-
     main = (question.search_text or question.text).strip()
     if main:
         queries.append(main[:DENSE_QUERY_MAX_CHARS])
-
-    # HyDE — гипотетический ответ, очень мощный сигнал
     if question.hyde:
         for h in question.hyde[:2]:
             h = h.strip()[:DENSE_QUERY_MAX_CHARS]
@@ -223,8 +196,6 @@ def build_query_texts(question: Question) -> list[str]:
                 queries.append(h)
                 if len(queries) >= MAX_QUERY_VARIANTS:
                     break
-
-    # Варианты если ещё есть место
     if len(queries) < MAX_QUERY_VARIANTS and question.variants:
         for v in question.variants:
             v = v.strip()[:DENSE_QUERY_MAX_CHARS]
@@ -232,31 +203,23 @@ def build_query_texts(question: Question) -> list[str]:
                 queries.append(v)
                 if len(queries) >= MAX_QUERY_VARIANTS:
                     break
-
     return queries or [question.text[:DENSE_QUERY_MAX_CHARS]]
 
 
 def build_sparse_query_text(question: Question) -> str:
-    """Keyword-heavy текст для BM25 поиска."""
     parts: list[str] = []
-
     main = (question.search_text or question.text).strip()
     if main:
         parts.append(main)
-
     if question.keywords:
         parts.append(" ".join(question.keywords))
-
     if question.entities:
         e = question.entities
         for lst in [e.people, e.names, e.documents, e.emails]:
             if lst:
                 parts.append(" ".join(lst))
-
     return " ".join(parts)
 
-
-# ---------- Date filter ----------
 
 def build_date_filter(question: Question) -> models.Filter | None:
     if not question.date_range:
@@ -274,12 +237,9 @@ def build_date_filter(question: Question) -> models.Filter | None:
                 range=models.DatetimeRange(lte=question.date_range.to),
             ))
         return models.Filter(must=conditions) if conditions else None
-    except Exception as e:
-        logger.warning("Failed to build date filter: %s", e)
+    except Exception:
         return None
 
-
-# ---------- Qdrant search — ОДИН запрос ----------
 
 async def qdrant_search(
     client: AsyncQdrantClient,
@@ -287,7 +247,6 @@ async def qdrant_search(
     sparse_vector: SparseVector,
     query_filter: models.Filter | None = None,
 ) -> list[Any]:
-    """Один запрос в Qdrant с dense+sparse prefetch и RRF fusion."""
     response = await client.query_points(
         collection_name=QDRANT_COLLECTION_NAME,
         prefetch=[
@@ -314,8 +273,6 @@ async def qdrant_search(
     return response.points or []
 
 
-# ---------- Rerank ----------
-
 async def get_rerank_scores(
     client: httpx.AsyncClient,
     label: str,
@@ -323,8 +280,6 @@ async def get_rerank_scores(
 ) -> list[float]:
     if not targets:
         return []
-
-    # Retry с exponential backoff при 429
     for attempt in range(5):
         response = await client.post(
             RERANKER_URL,
@@ -338,15 +293,11 @@ async def get_rerank_scores(
         )
         if response.status_code == 429:
             wait = 2 ** attempt
-            logger.warning("Reranker 429, retry %d after %ds", attempt + 1, wait)
             await asyncio.sleep(wait)
             continue
         response.raise_for_status()
         data = response.json().get("data") or []
         return [float(s["score"]) for s in data]
-
-    # Все попытки исчерпаны — не падаем, просто без rerank
-    logger.error("Reranker rate limit exhausted after 5 retries")
     return [0.0] * len(targets)
 
 
@@ -356,19 +307,14 @@ async def rerank_points(
     points: list[Any],
 ) -> list[Any]:
     candidates = points[:RERANK_TOP]
-
-    # Фильтруем пустые тексты, обрезаем длинные
     targets_raw = [(point.payload or {}).get("page_content") or "" for point in candidates]
     valid_idx = [i for i, t in enumerate(targets_raw) if t.strip()]
     valid_targets = [targets_raw[i][:RERANK_TEXT_MAX_CHARS] for i in valid_idx]
     valid_candidates = [candidates[i] for i in valid_idx]
     empty_candidates = [candidates[i] for i in range(len(candidates)) if i not in set(valid_idx)]
-
     if not valid_targets:
         return candidates + points[RERANK_TOP:]
-
     scores = await get_rerank_scores(client, query[:DENSE_QUERY_MAX_CHARS], valid_targets)
-
     reranked = [
         point for _, point in sorted(
             zip(scores, valid_candidates),
@@ -376,11 +322,8 @@ async def rerank_points(
             reverse=True,
         )
     ]
-
     return reranked + empty_candidates + points[RERANK_TOP:]
 
-
-# ---------- Helpers ----------
 
 def extract_message_ids(point: Any) -> list[str]:
     payload = point.payload or {}
@@ -401,8 +344,6 @@ def deduplicate_ids(points: list[Any], limit: int = 50) -> list[str]:
     return result
 
 
-# ---------- Endpoints ----------
-
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -414,52 +355,29 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     query = question.text.strip()
     if not query:
         raise HTTPException(status_code=400, detail="question.text is required")
-
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
-
-    # 1. Строим тексты для multi-query dense эмбеддинга
     query_texts = build_query_texts(question)
     sparse_text = build_sparse_query_text(question)
-
-    logger.info("Query variants: %d | sparse: %.60s...", len(query_texts), sparse_text)
-
-    # 2. Параллельно эмбеддим dense (батч) и sparse
     dense_vectors, sparse_vector = await asyncio.gather(
         embed_dense_batch(client, query_texts),
         embed_sparse(sparse_text),
     )
-
-    # 3. Усредняем dense векторы → ОДИН запрос в Qdrant
     merged_dense = average_dense_vectors(dense_vectors)
-
-    # 4. Фильтр по датам
     date_filter = build_date_filter(question)
-
-    # 5. Один запрос в Qdrant
     points = await qdrant_search(qdrant, merged_dense, sparse_vector, date_filter)
-
-    # 6. Если с фильтром ничего — повторяем без фильтра
     if not points and date_filter:
-        logger.info("No results with date filter, retrying without")
         points = await qdrant_search(qdrant, merged_dense, sparse_vector, None)
-
     if not points:
         return SearchAPIResponse(results=[])
-
-    # 7. Rerank
     rerank_query = (question.search_text or query)
     points = await rerank_points(client, rerank_query, points)
-
-    # 8. Топ-50 message_ids без дублей
     message_ids = deduplicate_ids(points, limit=50)
-
     return SearchAPIResponse(results=[SearchAPIItem(message_ids=message_ids)])
 
 
 @app.exception_handler(Exception)
 async def exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception(exc)
     if isinstance(exc, RequestValidationError):
         return JSONResponse(status_code=422, content={"detail": exc.errors()})
     if isinstance(exc, HTTPException):
