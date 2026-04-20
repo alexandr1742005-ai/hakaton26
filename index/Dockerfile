@@ -14,10 +14,8 @@ ENV HF_HOME=/models/huggingface
 
 RUN mkdir -p /models/fastembed /models/huggingface
 
-# Скачиваем sparse модель во время сборки (в контейнере нет интернета)
 RUN python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding(model_name='Qdrant/bm25')"
 
 EXPOSE 8000
 
-# Запускаем через CLI uvicorn — надёжнее чем programmatic API с workers
 CMD ["sh", "-c", "uvicorn main:app --host $HOST --port $PORT --workers 4"]
